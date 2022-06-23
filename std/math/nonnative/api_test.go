@@ -11,6 +11,7 @@ import (
 	bls12377 "github.com/consensys/gnark-crypto/ecc/bls12-377"
 	"github.com/consensys/gnark/backend"
 	"github.com/consensys/gnark/frontend"
+	"github.com/consensys/gnark/frontend/cs/r1cs"
 	"github.com/consensys/gnark/internal/backend/circuits"
 	"github.com/consensys/gnark/std/algebra/fields_bls12377"
 	"github.com/consensys/gnark/std/algebra/sw_bls12377"
@@ -104,6 +105,78 @@ func TestEmulatedApi(t *testing.T) {
 	assert.ProverSucceeded(&circuit, &witness, test.WithProverOpts(backend.WithHints(GetHints()...)), test.WithCurves(testCurve))
 }
 
+type WrapperCircuit struct {
+	X1, X2, X3, X4, X5, X6 frontend.Variable
+	Res                    frontend.Variable
+}
+
+func (c *WrapperCircuit) Define(api frontend.API) error {
+	// compute x1^3 + 5*x2 + (x3-x4) / (x5+x6)
+	x13 := api.Mul(c.X1, c.X1, c.X1)
+	fx2 := api.Mul(5, c.X2)
+	nom := api.Sub(c.X3, c.X4)
+	denom := api.Add(c.X5, c.X6)
+	free := api.Div(nom, denom)
+	res := api.Add(x13, fx2, free)
+	api.AssertIsEqual(res, c.Res)
+	return nil
+}
+
+func TestTestEngineWrapper(t *testing.T) {
+	assert := test.NewAssert(t)
+	r := ecc.BN254.ScalarField()
+	params, err := NewParams(32, r)
+	assert.NoError(err)
+
+	circuit := WrapperCircuit{
+		X1:  params.Placeholder(),
+		X2:  params.Placeholder(),
+		X3:  params.Placeholder(),
+		X4:  params.Placeholder(),
+		X5:  params.Placeholder(),
+		X6:  params.Placeholder(),
+		Res: params.Placeholder(),
+	}
+	x1, x2, x3, x4, x5, x6, res := witnessData(params.r)
+	witness := WrapperCircuit{
+		X1:  params.ConstantFromBigOrPanic(x1),
+		X2:  params.ConstantFromBigOrPanic(x2),
+		X3:  params.ConstantFromBigOrPanic(x3),
+		X4:  params.ConstantFromBigOrPanic(x4),
+		X5:  params.ConstantFromBigOrPanic(x5),
+		X6:  params.ConstantFromBigOrPanic(x6),
+		Res: params.ConstantFromBigOrPanic(res),
+	}
+	wrapperOpt := test.WithApiWrapper(func(api frontend.API) frontend.API {
+		return NewAPI(api, params)
+	})
+	err = test.IsSolved(&circuit, &witness, testCurve.ScalarField(), wrapperOpt)
+	assert.NoError(err)
+}
+
+func TestCompilerWrapper(t *testing.T) {
+	assert := test.NewAssert(t)
+	r := ecc.BN254.ScalarField()
+	params, err := NewParams(32, r)
+	assert.NoError(err)
+
+	circuit := WrapperCircuit{}
+	// x1, x2, x3, x4, x5, x6, res := witnessData(params.r)
+	// witness := WrapperCircuit{
+	// 	X1:  params.ConstantFromBigOrPanic(x1),
+	// 	X2:  params.ConstantFromBigOrPanic(x2),
+	// 	X3:  params.ConstantFromBigOrPanic(x3),
+	// 	X4:  params.ConstantFromBigOrPanic(x4),
+	// 	X5:  params.ConstantFromBigOrPanic(x5),
+	// 	X6:  params.ConstantFromBigOrPanic(x6),
+	// 	Res: params.ConstantFromBigOrPanic(res),
+	// }
+	ccs, err := frontend.Compile(testCurve.ScalarField(), NewBuilder(r1cs.NewBuilder, params), &circuit)
+	assert.NoError(err)
+	t.Log(ccs.GetNbConstraints())
+	// assert.ProverSucceeded(&circuit, &witness, test.WithCompileOpts(wrapperOpt), test.WithCurves(testCurve), test.WithProverOpts(backend.WithHints(GetHints()...)))
+}
+
 func TestIntegrationApi(t *testing.T) {
 	assert := test.NewAssert(t)
 	r := ecc.BN254.ScalarField()
@@ -172,17 +245,28 @@ func TestPairingBLS377(t *testing.T) {
 		return NewAPI(api, params)
 	})
 
-	// pairing test data
 	_, _, P, Q := bls12377.Generators()
 	milRes, _ := bls12377.MillerLoop([]bls12377.G1Affine{P}, []bls12377.G2Affine{Q})
 	pairingRes := bls12377.FinalExponentiation(&milRes)
 
-	// create cs
-	var circuit pairingBLS377
-	circuit.pairingRes = pairingRes
+	circuit := pairingBLS377{
+		// pairingRes: pairingRes,
+		// P: sw_bls12377.G1Affine{
+		// 	X: params.Placeholder(),
+		// 	Y: params.Placeholder(),
+		// },
+		// Q: sw_bls12377.G2Affine{
+		// 	X: fields_bls12377.E2{
+		// 		A0: params.Placeholder(),
+		// 		A1: params.Placeholder(),
+		// 	},
+		// 	Y: fields_bls12377.E2{
+		// 		A0: params.Placeholder(),
+		// 		A1: params.Placeholder(),
+		// 	},
+		// },
+	}
 
-	// assign values to witness
-	// var pxb, pyb, qxab, qxbb, qyab, qybb *big.Int
 	pxb := new(big.Int)
 	pyb := new(big.Int)
 	qxab := new(big.Int)
@@ -207,8 +291,12 @@ func TestPairingBLS377(t *testing.T) {
 		},
 	}
 
-	err = test.IsSolved(&circuit, &witness, testCurve.ScalarField(), wrapperOpt)
-	// assert.SolvingSucceeded(&circuit, &witness, test.WithCurves(ecc.BW6_761),
-	// test.WithBackends(backend.GROTH16))
+	// assert.SolvingSucceeded(&circuit, &witness, test.WithCurves(ecc.BW6_761), test.WithBackends(backend.GROTH16))
+	// err = test.IsSolved(&circuit, &witness, testCurve.ScalarField(), wrapperOpt)
+	// assert.NoError(err)
+	_ = witness
+	_ = wrapperOpt
+	ccs, err := frontend.Compile(testCurve.ScalarField(), NewBuilder(r1cs.NewBuilder, params), &circuit)
 	assert.NoError(err)
+	t.Log(ccs.GetNbConstraints())
 }
